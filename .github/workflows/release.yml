@@ -1,0 +1,140 @@
+name: release
+
+# 由 F:/07_AI项目/_通用工具/公开编译/同步公开仓库.py 生成；公开仓库只放编译需要的代码，密钥全在仓库 Secrets 里。
+on:
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: "测试通过后签名上传 App Store Connect"
+        type: boolean
+        default: true
+      flow:
+        description: "跑界面流程测试并导出截图（不上传）"
+        type: boolean
+        default: false
+      record:
+        description: "只跑 testReviewDemo 并录屏给苹果审核（2.1 要录屏时用）"
+        type: boolean
+        default: false
+
+concurrency: release
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      PROJECT: WeightCycle
+      APP_ID: com.hgsldswk.weightcycle
+      BUILD_NUMBER: ${{ github.run_number }}
+      BUILD_OFFSET: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: 选最新正式版 Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | grep -viE 'beta|release_candidate' | sort -V | tail -1)
+          sudo xcode-select -s "$XC"; xcodebuild -version
+      - run: brew install xcodegen && xcodegen generate
+      - name: 单元测试
+        run: |
+          DEVICE=$(xcrun simctl list devices available -j | python3 ci/pick_simulator.py)
+          set -o pipefail
+          xcodebuild test -project "$PROJECT.xcodeproj" -scheme "$PROJECT" -destination "id=$DEVICE" \
+            -skip-testing:"${PROJECT}UITests" CODE_SIGNING_ALLOWED=NO | tee build.log \
+            | grep -E "error:|Test Case .* failed|TEST (SUCCEEDED|FAILED)|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "TEST SUCCEEDED" build.log
+      - name: 界面流程测试与截图
+        if: inputs.flow
+        run: |
+          DEVICE=$(xcrun simctl list devices available -j | python3 ci/pick_simulator.py --promax 2>/dev/null || xcrun simctl list devices available -j | python3 ci/pick_simulator.py)
+          SCHEME="${PROJECT}UI"
+          xcodebuild -list -project "$PROJECT.xcodeproj" | grep -q "^ *${SCHEME}$" || SCHEME="$PROJECT"
+          mkdir -p flow_shots build
+          ONLY="${PROJECT}UITests"
+          # 11-23 钩针方块排版 2.1 要求录屏：record=true 时只跑演示用例并用模拟器录屏
+          if [ "${{ inputs.record }}" = "true" ]; then
+            T=$(grep -rl "func testReviewDemo" "${PROJECT}UITests" | head -1)
+            [ -n "$T" ] && ONLY="${PROJECT}UITests/$(basename "$T" .swift)/testReviewDemo"
+            xcrun simctl boot "$DEVICE" || true
+            xcrun simctl bootstatus "$DEVICE" -b || true
+            xcrun simctl io "$DEVICE" recordVideo --codec=h264 --force flow_shots/review.mp4 & REC=$!
+            sleep 3
+          fi
+          set +e
+          TEST_RUNNER_SHOTS_DIR="$PWD/flow_shots" xcodebuild test -project "$PROJECT.xcodeproj" -scheme "$SCHEME" \
+            -destination "id=$DEVICE" -only-testing:"$ONLY" \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 180 \
+            -resultBundlePath build/flow.xcresult CODE_SIGNING_ALLOWED=NO > flow.log 2>&1
+          status=$?
+          if [ -n "${REC:-}" ]; then kill -INT $REC; wait $REC || true; ls -la flow_shots/review.mp4 || true; fi
+          set -e
+          grep -iE "Test Case .* (passed|failed)|error:|TEST (SUCCEEDED|FAILED)|crash|Restarting after" flow.log | tail -80
+          if [ -f ci/export_shots.py ]; then python3 ci/export_shots.py build/flow.xcresult flow_shots || true
+          else xcrun xcresulttool export attachments --path build/flow.xcresult --output-path flow_shots || true; fi
+          exit $status
+      - name: 上传截图
+        if: always() && inputs.flow
+        uses: actions/upload-artifact@v4
+        with:
+          name: flow_shots
+          path: |
+            flow_shots/**/*.png
+            flow_shots/*.mp4
+            flow.log
+      - name: 导入证书、描述文件和接口密钥
+        if: inputs.upload
+        env:
+          DIST_P12: ${{ secrets.DIST_P12 }}
+          DIST_P12_PASSWORD: ${{ secrets.DIST_P12_PASSWORD }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          PROFILES_TGZ: ${{ secrets.PROFILES_TGZ }}
+        run: |
+          set -euo pipefail
+          KC=$RUNNER_TEMP/sign.keychain-db
+          security create-keychain -p ci "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p ci "$KC"
+          printf '%s' "$DIST_P12" | tr -d '[:space:]' | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -P "$DIST_P12_PASSWORD" -A -t cert -f pkcs12 -k "$KC"
+          security set-key-partition-list -S apple-tool:,apple: -k ci "$KC" > /dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          mkdir -p "$RUNNER_TEMP/profiles"
+          printf '%s' "$PROFILES_TGZ" | tr -d '[:space:]' | base64 --decode | tar -xz -C "$RUNNER_TEMP/profiles"
+          for d in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$d"
+            for f in "$RUNNER_TEMP"/profiles/*.mobileprovision; do
+              uuid=$(security cms -D -i "$f" | plutil -extract UUID raw -o - -)
+              cp "$f" "$d/$uuid.mobileprovision"
+            done
+          done
+          mkdir -p "$HOME/keys"
+          printf '%s' "$ASC_KEY_P8" > "$HOME/keys/AuthKey.p8"
+      - name: 归档并上传
+        if: inputs.upload
+        env:
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          NUM=$((BUILD_NUMBER + BUILD_OFFSET))
+          echo "构建号 $NUM"
+          xcodebuild archive -project "$PROJECT.xcodeproj" -scheme "$PROJECT" -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "build/$PROJECT.xcarchive" \
+            APP_ID="$APP_ID" DEVELOPMENT_TEAM="$TEAM_ID" CURRENT_PROJECT_VERSION="$NUM" > archive.log 2>&1 \
+            || { grep -E "error:" archive.log | head -40; tail -40 archive.log; exit 1; }
+          if [ -f ci/export_options.py ]; then python3 ci/export_options.py > build/ExportOptions.plist
+          else sed "s/__TEAM_ID__/$TEAM_ID/" ci/ExportOptions.plist > build/ExportOptions.plist; fi
+          xcodebuild -exportArchive -archivePath "build/$PROJECT.xcarchive" \
+            -exportOptionsPlist build/ExportOptions.plist -exportPath build/export \
+            -authenticationKeyPath "$HOME/keys/AuthKey.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          echo "已上传，构建号 $NUM" >> "$GITHUB_STEP_SUMMARY"
+      - name: 上传日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            build.log
+            archive.log
